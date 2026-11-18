@@ -33,6 +33,7 @@ raw index keys so pooling can read them back.
 """
 
 import functools
+import inspect
 import logging
 from types import SimpleNamespace
 
@@ -53,6 +54,7 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     sigmoid_mul_quant,
 )
 from atom.model_ops.qwen4_exp.ops.qsa import (
+    FP8_DTYPE,
     qsa_apply_mrope,
     qsa_cache_formats,
     qsa_cache_row_layout,
@@ -92,6 +94,15 @@ def _flydsl_attention_op():
     return qsa_sparse_prefill
 
 
+@functools.cache
+def _flydsl_takes_fp8() -> bool:
+    # aiter's FP8 K/V (ROCm/aiter#8149) adds k_scale / v_scale / compute to the entry.
+    try:
+        return "k_scale" in inspect.signature(_flydsl_attention_op()).parameters
+    except ImportError:
+        return False
+
+
 def qsa_rank_heads(
     num_attention_heads: int, num_key_value_heads: int, tp_size: int
 ) -> tuple[int, int]:
@@ -115,18 +126,19 @@ def flydsl_fallback_reason(
     num_kv_heads: int,
     head_dim: int,
     *,
-    kv_bf16: bool,
+    kv_dtype: torch.dtype | None,
 ) -> str | None:
-    """Why QSA layers with this indexer, per-rank head shape and KV format
+    """Why QSA layers with this indexer, per-rank head shape and KV dtype
     cannot take the aiter FlyDSL attention, or None if they can. The kernel
     expects min(v // 4, T) blocks for a row with v visible tokens (width
     4T + 3); another budget or ratio selects a different number, so padding
-    its selection would give wrong output. The one authority for the layer's
-    fallback and the SGLang bridge's layout build; the per-call conditions
-    (host layout, selection byte span, graph capture, query dtype) stay with
-    the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
-    if not kv_bf16:
-        return "the KV cache is not BF16"
+    its selection would give wrong output. FP8 K/V need an aiter whose entry
+    takes their scales. The one authority for the layer's fallback and the
+    SGLang bridge's layout build; the per-call conditions (host layout,
+    selection byte span, graph capture, query dtype) stay with the layer.
+    `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
+    if kv_dtype not in (torch.bfloat16, FP8_DTYPE):
+        return f"KV cache dtype {kv_dtype} (needs BF16 or {FP8_DTYPE})"
     if compress_ratio != 4 or token_topk + 3 not in _FLYDSL_WIDTHS:
         return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
@@ -136,6 +148,8 @@ def flydsl_fallback_reason(
         )
     if not _flydsl_arch_supported():
         return "the GPU is not gfx942"
+    if kv_dtype == FP8_DTYPE and not _flydsl_takes_fp8():
+        return "the installed aiter qsa_sparse_prefill takes no FP8 K/V (no k_scale)"
     return None
 
 
@@ -151,12 +165,16 @@ def log_flydsl_fallback(reason: str) -> None:
 
 
 @functools.cache
-def _log_flydsl_active() -> None:
-    logger.info("QSA attention runs eager prefill on the aiter FlyDSL kernel")
+def _log_flydsl_active(kv: str) -> None:
+    logger.info(
+        "QSA attention runs eager prefill on the aiter FlyDSL kernel (K/V %s)", kv
+    )
 
 
-def _flydsl_call_fallback_reason(query, selected, width, qsa) -> str | None:
+def _flydsl_call_fallback_reason(query, selected, width, qsa, fp8) -> str | None:
     """Why this one laid-out prefill call cannot take the FlyDSL attention, or None."""
+    if fp8 and qsa.context_slots is None:
+        return "FP8 K/V without the context slots to read them through"
     if width is None:
         return f"selection wider than {_FLYDSL_WIDTHS[-1]} columns"
     # aiter rejects a padded selection spanning 2**31 bytes or more.
@@ -390,7 +408,8 @@ class Qwen4ExpAttention(nn.Module):
         self.k_scale_cache: torch.Tensor | None = None
         self.v_scale_cache: torch.Tensor | None = None
         self.compressed_key_scale: torch.Tensor | None = None
-        # Plugin hosts allocate and bind BF16 caches of their own.
+        # Plugin hosts allocate and bind caches of their own (the SGLang
+        # bridge: BF16, or FP8 K/V with the scale planes of Native's rows).
         self.kv_format, self.index_format = (
             ("bf16", "bf16") if is_plugin_mode() else qsa_cache_formats(atom_config)
         )
@@ -624,30 +643,47 @@ class Qwen4ExpAttention(nn.Module):
         if not envs.ATOM_QSA_FLYDSL_ATTN:
             return None
         width = next((w for w in _FLYDSL_WIDTHS if w >= selected.shape[1]), None)
-        # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
+        # Quantized K/V are FP8 rows with one FP32 scale per (token, KV head).
+        fp8 = self.k_scale_cache is not None
         reason = flydsl_fallback_reason(
             self.indexer.compress_ratio,
             self.indexer.token_topk,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            kv_bf16=self.k_scale_cache is None,
+            kv_dtype=FP8_DTYPE if fp8 else torch.bfloat16,
         )
         if reason is None and qsa.host_lens is None:
             # Not laid out for FlyDSL (target verify, warmup, ATOM's own
             # runner); the SGLang bridge logs its own reasons for skipping.
             return None
-        reason = reason or _flydsl_call_fallback_reason(query, selected, width, qsa)
+        reason = reason or _flydsl_call_fallback_reason(
+            query, selected, width, qsa, fp8
+        )
         if reason is not None:
             log_flydsl_fallback(reason)
             return None
-        _log_flydsl_active()
         query_lens, seq_lens = qsa.host_lens
-        if qsa.context_slots is None:
-            k, v = key.contiguous(), value.contiguous()
+        fp8_args = {}
+        if fp8:
+            # Read in place through the context slots, also without a prefix,
+            # so prefill attends to the same FP8 K/V that decode reads.
+            k, v = self.k_cache.flatten(0, 1), self.v_cache.flatten(0, 1)
+            compute = "fp8" if envs.ATOM_QSA_FLYDSL_FP8_MFMA else "bf16"
+            fp8_args = {
+                "kv_slots": qsa.context_slots,
+                "k_scale": self.k_scale_cache.flatten(0, 1),
+                "v_scale": self.v_scale_cache.flatten(0, 1),
+                "compute": compute,
+            }
+            _log_flydsl_active(f"{FP8_DTYPE}, compute={compute}")
         else:
-            k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
-            v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+            _log_flydsl_active(str(torch.bfloat16))
+            if qsa.context_slots is None:
+                k, v = key.contiguous(), value.contiguous()
+            else:
+                k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+                v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
         # The expansion drops columns no row can reach (short contexts select
         # every complete block, then the tail, left-aligned), so padding with -1
         # keeps each row's layout. The kernel does not validate it: a malformed
@@ -663,6 +699,7 @@ class Qwen4ExpAttention(nn.Module):
             query_lens=query_lens,
             prefix_lens=tuple(s - q for q, s in zip(query_lens, seq_lens)),
             softmax_scale=self.scaling,
+            **fp8_args,
         )
 
     def _profile_attention(self, query, key, value, hidden_states, positions):

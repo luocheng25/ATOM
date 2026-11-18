@@ -10,7 +10,7 @@ The recognition patch supplies Flash config registration for that version.
 (query-sparse, 2048-token budget) attention layers, 4-stream
 hyper-connections, 512 routed experts (top-10) plus a sigmoid-gated shared
 expert, and n-gram PLE on layer 1. Weights: per-channel FP8 (PTPC), KV cache
-BF16.
+BF16 or FP8 (see [FP8 KV cache](#fp8-kv-cache)).
 
 ## Text serving with MTP
 
@@ -57,6 +57,24 @@ curl http://127.0.0.1:8000/generate \
   -H 'Content-Type: application/json' \
   -d '{"text":"The result of 17 + 25 is", "sampling_params":{"temperature":0,"top_k":1,"top_p":1,"max_new_tokens":64}}'
 ```
+
+## FP8 KV cache
+
+Replace `--kv-cache-dtype bf16` with `--kv-cache-dtype fp8_e4m3`. With MTP, also
+pass `--speculative-draft-kv-cache-dtype bf16`: the draft layer keeps a BF16
+cache, as Native ATOM does by default (`ATOM_QSA_DRAFT_KV_BF16`).
+
+The 12 QSA layers store K/V as E4M3 with one FP32 scale per token and KV head;
+the plugin allocates the scale planes beside SGLang's pool. Eager prefill runs
+aiter's FlyDSL sparse prefill on the FP8 pool in place, with FP8 MFMAs
+(`ATOM_QSA_FLYDSL_FP8_MFMA=0` dequantizes to BF16 instead). That needs an aiter
+with FP8 K/V ([ROCm/aiter#8149](https://github.com/ROCm/aiter/pull/8149));
+with an older aiter, FP8 prefill falls back to the native QSA kernel.
+
+On MI308X with the MTP configuration at a 132096 context, 64 running requests
+and `--mem-fraction-static 0.95`, the pool holds 335,168 tokens against
+177,408 with BF16 (1.89x), and GSM8K scores 0.978 against 0.980 with the same
+acceptance length.
 
 ## Long-context high-throughput serving (no MTP)
 
@@ -142,7 +160,8 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
 
 ## Boundaries
 
-- Use BF16 KV and page size 64. TP greater than 1 without EP is validated only
+- Use BF16 or FP8 (`fp8_e4m3`) KV and page size 64. TP greater than 1 without
+  EP is validated only
   for the PTPC checkpoint without MTP (the long-context configuration above,
   TP2/EP1); otherwise use EP, as the MTP configuration does, because the
   expert intermediate width is 640.

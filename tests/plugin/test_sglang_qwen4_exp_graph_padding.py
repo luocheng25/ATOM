@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_ops.qwen4_exp.ops.qsa import FP8_DTYPE
 from atom.plugin.sglang.attention_backend.backend_resolver import real_batch_size
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _CHECKPOINT_CONTEXT_LEN,
@@ -1363,14 +1364,24 @@ def test_checkpoint_context_resolved_once_per_config(monkeypatch):
     assert len(walks) > first
 
 
-def _flydsl_layout(extends, seqs, live_bs, num_tokens):
+def _flydsl_layout(extends, seqs, live_bs, num_tokens, read_pool=False):
     fb = SimpleNamespace(extend_seq_lens_cpu=extends, seq_lens_cpu=seqs)
     tables = torch.zeros((max(live_bs, 1), 4), dtype=torch.int32)
-    return _flydsl_prefill_layout(fb, live_bs, num_tokens, tables, 64)
+    return _flydsl_prefill_layout(
+        fb, live_bs, num_tokens, tables, 64, read_pool=read_pool
+    )
 
 
 def test_flydsl_prefill_layout_unprefixed_batch_has_no_context_slots():
     assert _flydsl_layout([3, 5], [3, 5], 2, 8) == (((3, 5), (3, 5)), None)
+
+
+def test_flydsl_prefill_layout_reads_an_fp8_pool_through_slots_unprefixed():
+    """FP8 K/V are read in place, so an unprefixed batch gets its slots too."""
+    host_lens, slots = _flydsl_layout([3, 5], [3, 5], 2, 8, read_pool=True)
+    assert host_lens == ((3, 5), (3, 5))
+    assert slots.dtype == torch.int32
+    assert slots.tolist() == [0, 1, 2, 0, 1, 2, 3, 4]
 
 
 @pytest.mark.parametrize(
@@ -1394,8 +1405,9 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
     assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)
 
 
-def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
-    """Flag on, `tp` ranks, `arch` for gfx942; returns the layer module."""
+def _flydsl_gate_env(monkeypatch, tp=4, arch=True, takes_fp8=True):
+    """Flag on, `tp` ranks, `arch` for gfx942, `takes_fp8` for an aiter whose
+    entry takes FP8 K/V; returns the layer module."""
     qsa_attention = pytest.importorskip(
         "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
     )
@@ -1403,6 +1415,7 @@ def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
 
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
     monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: arch)
+    monkeypatch.setattr(qsa_attention, "_flydsl_takes_fp8", lambda: takes_fp8)
     monkeypatch.setattr(
         parallel_state, "get_tensor_model_parallel_world_size", lambda: tp
     )
@@ -1428,7 +1441,8 @@ _FLASH_CONFIG = SimpleNamespace(
         ("1", True, None, 4, 4096, 4, False),  # dtype unreadable: native
         ("0", True, torch.bfloat16, 4, 2048, 4, False),  # flag off
         ("1", False, torch.bfloat16, 4, 2048, 4, False),  # not gfx942
-        ("1", True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
+        ("1", True, FP8_DTYPE, 4, 2048, 4, True),  # FP8 KV pool
+        ("1", True, torch.float16, 4, 2048, 4, False),  # neither BF16 nor FP8
         ("1", True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
         ("1", True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
     ],
@@ -1457,6 +1471,16 @@ def test_flydsl_layout_logs_each_fallback_reason_once(monkeypatch, caplog):
     assert len(reasons) == 1 and "24 q / 2 kv heads" in reasons[0]
 
 
+def test_flydsl_layout_fp8_pool_needs_an_fp8_aiter(monkeypatch, caplog):
+    """An aiter whose entry takes no k_scale keeps an FP8 pool native."""
+    _flydsl_gate_env(monkeypatch, takes_fp8=False)
+    batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=FP8_DTYPE))
+    with caplog.at_level("WARNING"):
+        assert not _flydsl_layout_needed(batch, _FLASH_CONFIG, 4, 2048)
+    reasons = [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+    assert len(reasons) == 1 and "no FP8 K/V" in reasons[0]
+
+
 @pytest.mark.parametrize(
     "backend,needed",
     [
@@ -1467,10 +1491,10 @@ def test_flydsl_layout_logs_each_fallback_reason_once(monkeypatch, caplog):
             SimpleNamespace(
                 token_to_kv_pool=None,
                 full_attn_backend=SimpleNamespace(
-                    token_to_kv_pool=SimpleNamespace(dtype=torch.float8_e4m3fn)
+                    token_to_kv_pool=SimpleNamespace(dtype=FP8_DTYPE)
                 ),
             ),
-            False,
+            True,
         ),
         (SimpleNamespace(), False),
     ],
@@ -1499,3 +1523,4 @@ def test_flydsl_prefill_layout_context_rows_on_device_tensors():
         for t in range(seq)
     ]
     assert slots.device == tables.device
+    assert slots.dtype == torch.int32

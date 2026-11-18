@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_ops.qwen4_exp.ops.qsa import FP8_DTYPE
 from atom.plugin.config import _build_atom_speculative_config_from_sglang
 from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
@@ -209,18 +210,20 @@ class _QsaLayer:
         self.num_kv_heads = 2
         self.head_dim = 4
         self.bound = None
+        self.scales = None
 
-    def bind_caches(self, k, v, raw, compressed, rope):
+    def bind_caches(self, k, v, raw, compressed, rope, **scales):
         self.bound = (k, v, raw, compressed)
+        self.scales = scales
 
 
 class _Pool:
-    def __init__(self, layers=1, tokens=64, heads=2, dim=4):
+    def __init__(self, layers=1, tokens=64, heads=2, dim=4, dtype=torch.float32):
         self.size = tokens
         self._bufs = {
             i: (
-                torch.zeros(tokens, heads, dim),
-                torch.zeros(tokens, heads, dim),
+                torch.zeros(tokens, heads, dim, dtype=dtype),
+                torch.zeros(tokens, heads, dim, dtype=dtype),
             )
             for i in range(layers)
         }
@@ -256,6 +259,34 @@ def test_bind_qsa_caches_uses_explicit_layer_mapping(model_type, pool_layer):
     assert raw.shape[0] == 1
     assert compressed.shape == (1, 16, 1, 8)
     assert model._atom_qwen4_exp_qsa_bound is True
+    assert layer.scales == {}
+
+
+def test_bind_qsa_caches_gives_an_fp8_pool_scale_planes():
+    """FP8 K/V views of the pool plus one FP32 scale per (token, KV head)."""
+    layers = [_QsaLayer(layer_num=n) for n in (3, 7)]
+    model = SimpleNamespace(
+        modules=lambda: layers, parameters=lambda: iter([torch.zeros(1)])
+    )
+    pool = _Pool(layers=8, tokens=128, dtype=FP8_DTYPE)
+    fb = SimpleNamespace(token_to_kv_pool=pool, page_size=64)
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp_text", indexer_compress_ratio=4, indexer_head_dim=8
+        )
+    )
+    bind_qsa_caches(model, fb, config)
+    for layer in layers:
+        k, _, _, _ = layer.bound
+        assert k.dtype == FP8_DTYPE and tuple(k.shape) == (2, 64, 2, 4)
+        assert k.data_ptr() == pool._bufs[layer.layer_num][0].data_ptr()
+        k_scale, v_scale = layer.scales["k_scale_cache"], layer.scales["v_scale_cache"]
+        assert k_scale.dtype == torch.float32 and tuple(k_scale.shape) == (2, 64, 2)
+        assert k_scale.is_contiguous() and v_scale.stride() == k_scale.stride()
+        assert k_scale.data_ptr() != v_scale.data_ptr()
+    assert layers[0].scales["k_scale_cache"].data_ptr() != (
+        layers[1].scales["k_scale_cache"].data_ptr()
+    )
 
 
 def test_target_qsa_missing_layer_does_not_fall_back_to_zero():

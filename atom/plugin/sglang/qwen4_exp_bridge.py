@@ -33,6 +33,7 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
     Qwen4ExpPLEMetadata,
     Qwen4ExpQSAMetadata,
 )
+from atom.model_ops.qwen4_exp.ops.qsa import FP8_DTYPE
 from atom.plugin.sglang.attention_backend.backend_resolver import (
     real_batch_size,
     resolve_attn_backend,
@@ -1209,7 +1210,12 @@ def build_qsa_metadata(
         forward_batch, atom_config, compress_ratio, indexer_budget
     ):
         host_lens, context_slots = _flydsl_prefill_layout(
-            forward_batch, live_bs, num_tokens, block_tables, block_size
+            forward_batch,
+            live_bs,
+            num_tokens,
+            block_tables,
+            block_size,
+            read_pool=_kv_pool_dtype(forward_batch) == FP8_DTYPE,
         )
     qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
@@ -1232,9 +1238,9 @@ def _flydsl_layout_needed(
     its host layout is worth building: `qsa_attention.flydsl_fallback_reason`,
     the predicate the layer's fallback uses, on the per-rank head shape of
     this model's config and the KV dtype of the pool the QSA caches are bound
-    from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
-    detect it; a pool whose dtype cannot be read keeps the native kernel. With
-    the flag on, each reason is logged once."""
+    from (`bind_qsa_caches` gives an FP8 pool its scale planes); a pool whose
+    dtype cannot be read keeps the native kernel. With the flag on, each
+    reason is logged once."""
     if not envs.ATOM_QSA_FLYDSL_ATTN:
         return False  # flag off: keep the bridge free of the layer module
     from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -1247,19 +1253,22 @@ def _flydsl_layout_needed(
         int(hf.num_key_value_heads),
         get_tensor_model_parallel_world_size(),
     )
-    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
     reason = qsa_attention.flydsl_fallback_reason(
         compress_ratio,
         indexer_budget,
         num_heads,
         num_kv_heads,
         int(hf.head_dim),
-        kv_bf16=kv_dtype == torch.bfloat16,
+        kv_dtype=_kv_pool_dtype(forward_batch),
     )
     if reason is not None:
         qsa_attention.log_flydsl_fallback(reason)
         return False
     return True
+
+
+def _kv_pool_dtype(forward_batch: Any) -> torch.dtype | None:
+    return getattr(_token_to_kv_pool(forward_batch), "dtype", None)
 
 
 def _token_to_kv_pool(forward_batch: Any) -> Any:
@@ -1279,8 +1288,11 @@ def _flydsl_prefill_layout(
     num_tokens: int,
     block_tables: torch.Tensor,
     block_size: int,
+    *,
+    read_pool: bool = False,
 ) -> tuple[tuple | None, torch.Tensor | None]:
-    """Host lengths for FlyDSL QSA attention, plus context rows when prefixed.
+    """Host lengths for FlyDSL QSA attention, plus int32 context rows when
+    prefixed, or always with `read_pool` (an FP8 pool is read through them).
 
     Returns (None, None) unless the packed tokens are exactly the scheduled
     extends, so padded or partial batches keep the native kernel.
@@ -1298,7 +1310,7 @@ def _flydsl_prefill_layout(
         or any(e < 0 or s < e for e, s in zip(extends, seqs))
     ):
         return None, None
-    if all(s == e for e, s in zip(extends, seqs)):
+    if not read_pool and all(s == e for e, s in zip(extends, seqs)):
         return (extends, seqs), None
     # Built on the device from the per-request lengths (a few bytes up):
     # host-side index arrays would be MBs per prefixed forward.
@@ -1312,7 +1324,9 @@ def _flydsl_prefill_layout(
         torch.cumsum(lengths, 0) - lengths, lengths, output_size=total
     )
     pages = block_tables[requests, tokens // block_size].to(torch.int64)
-    return (extends, seqs), pages * block_size + tokens % block_size
+    # aiter reads a pool through int32 slots.
+    slots = pages * block_size + tokens % block_size
+    return (extends, seqs), slots.to(torch.int32)
 
 
 def _mamba_physical_slots(pool: Any) -> int:
@@ -1627,7 +1641,9 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     Main K/V therefore views the SGLang buffer when it is already
     ``[tokens, heads, dim]`` with ``tokens % block_size == 0`` (same bytes as
     Native ``[pages, block, heads, dim]``). Indexer raw/compressed stay
-    plugin-owned, as in #2048.
+    plugin-owned, as in #2048. An FP8 pool (``--kv-cache-dtype fp8_e4m3``)
+    holds Native's FP8 rows; their FP32 scales, one per (token, KV head),
+    are plugin-owned planes.
     """
     if getattr(model, "_atom_qwen4_exp_qsa_bound", False):
         return
@@ -1686,6 +1702,7 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
         device=device,
     )
     pool_shape = None
+    kv_scales = None
     for i, layer in enumerate(qsa_layers):
         # Native draft layer 48 belongs to a separate, single-layer SGLang
         # pool. Target layers retain their logical ids; the pool owns their
@@ -1715,18 +1732,37 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
         k_cache = k_buf.view(pages, block_size, heads, dim)
         v_cache = v_buf.view(pages, block_size, heads, dim)
         pool_shape = tuple(k_buf.shape)
-        layer.bind_caches(k_cache, v_cache, raw[i], compressed[i], None)
+        scales = {}
+        if k_buf.dtype == FP8_DTYPE:
+            if kv_scales is None:
+                kv_scales = torch.zeros(
+                    (2, len(qsa_layers), pages, block_size, heads),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            scales = {
+                "k_scale_cache": kv_scales[0, i],
+                "v_scale_cache": kv_scales[1, i],
+            }
+        layer.bind_caches(k_cache, v_cache, raw[i], compressed[i], None, **scales)
     model._atom_qwen4_exp_qsa_raw = raw
     model._atom_qwen4_exp_qsa_compressed = compressed
+    model._atom_qwen4_exp_qsa_kv_scales = kv_scales
     model._atom_qwen4_exp_qsa_bound = True
     logger.info(
         "Bound %s QSA layers pages=%s block=%s compress=%s "
-        "pool_shape=%s (Native layout = paged view of [T,H,D])",
+        "pool_shape=%s kv=%s%s (Native layout = paged view of [T,H,D])",
         len(qsa_layers),
         num_pages,
         block_size,
         compress_ratio,
         pool_shape,
+        k_buf.dtype,
+        (
+            ""
+            if kv_scales is None
+            else f" + FP32 scale planes {kv_scales.nbytes / 2**20:.0f} MiB"
+        ),
     )
 
 

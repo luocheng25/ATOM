@@ -10,6 +10,7 @@ import torch
 pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
 from atom.model_ops.qwen4_exp import qsa_attention
+from atom.model_ops.qwen4_exp.ops.qsa import FP8_DTYPE
 from atom.model_ops.qwen4_exp.qsa_attention import Qwen4ExpAttention
 
 
@@ -47,6 +48,7 @@ def flydsl(monkeypatch):
     qsa_attention.log_flydsl_fallback.cache_clear()
     qsa_attention._log_flydsl_active.cache_clear()
     monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
+    monkeypatch.setattr(qsa_attention, "_flydsl_takes_fp8", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         qsa_attention,
@@ -79,11 +81,69 @@ def test_short_selection_is_padded_with_minus_one(flydsl, budget):
         {"indexer": SimpleNamespace(compress_ratio=8, token_topk=2048)},
         {"k_scale_cache": torch.ones(1)},
     ],
-    ids=["unsupported-budget", "ratio-8", "fp8-kv"],
+    ids=["unsupported-budget", "ratio-8", "fp8-kv-without-fp8-aiter"],
 )
 def test_unsupported_layer_falls_back(flydsl, overrides):
     assert _call(_layer(**overrides), _selection(8, 1539)) is None
     assert flydsl == []
+
+
+def _fp8_layer(pages=2, block=64):
+    """A layer bound like the SGLang bridge binds an FP8 pool."""
+    cache = torch.zeros(pages, block, 1, 256, dtype=FP8_DTYPE)
+    scale = torch.ones(pages, block, 1)
+    return _layer(
+        k_cache=cache,
+        v_cache=cache.clone(),
+        k_scale_cache=scale,
+        v_scale_cache=scale.clone(),
+    )
+
+
+@pytest.fixture
+def flydsl_fp8(flydsl, monkeypatch):
+    calls = []
+    monkeypatch.setattr(qsa_attention, "_flydsl_takes_fp8", lambda: True)
+    monkeypatch.setattr(
+        qsa_attention,
+        "_flydsl_attention_op",
+        lambda: lambda q, k, v, indices, **kw: calls.append((k, v, kw)) or q,
+    )
+    return calls
+
+
+@pytest.mark.parametrize("mfma,compute", [("1", "fp8"), ("0", "bf16")])
+def test_fp8_layer_reads_the_pool_in_place(flydsl_fp8, monkeypatch, mfma, compute):
+    """FP8 K/V go to aiter as the pool itself, its per-(token, KV head) scales
+    and the context slots, also without a prefix."""
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_FP8_MFMA", mfma)
+    layer, tokens = _fp8_layer(), 8
+    query = torch.zeros(tokens, 12, 256, dtype=torch.bfloat16)
+    key = torch.zeros(tokens, 1, 256, dtype=torch.bfloat16)
+    slots = torch.arange(64, 64 + tokens, dtype=torch.int32)
+    qsa = SimpleNamespace(host_lens=((tokens,), (tokens,)), context_slots=slots)
+    selected = _selection(tokens, 2051)
+    assert (
+        Qwen4ExpAttention._flydsl_attention(layer, query, key, key, selected, qsa)
+        is not None
+    )
+    ((k, v, kwargs),) = flydsl_fp8
+    assert k.dtype == FP8_DTYPE and tuple(k.shape) == (128, 1, 256)
+    assert k.data_ptr() == layer.k_cache.data_ptr()
+    assert v.data_ptr() == layer.v_cache.data_ptr()
+    assert kwargs["kv_slots"] is slots
+    assert tuple(kwargs["k_scale"].shape) == (128, 1)
+    assert kwargs["k_scale"].data_ptr() == layer.k_scale_cache.data_ptr()
+    assert kwargs["v_scale"].data_ptr() == layer.v_scale_cache.data_ptr()
+    assert kwargs["compute"] == compute
+    assert kwargs["prefix_lens"] == (0,)
+
+
+def test_fp8_layer_without_context_slots_falls_back(flydsl_fp8, caplog):
+    with caplog.at_level("WARNING"):
+        assert _call(_fp8_layer()) is None
+    assert flydsl_fp8 == []
+    assert any("context slots" in r.getMessage() for r in caplog.records)
 
 
 def test_selection_over_aiter_byte_limit_falls_back(flydsl):
@@ -318,3 +378,132 @@ def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
         num_decode_requests=None,
     )
     torch.testing.assert_close(flydsl, native, atol=1.6e-2, rtol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("compute", ["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "prefixes, extends",
+    [((0,), (300,)), ((200,), (300,)), ((0, 0, 100), (100, 37, 250)), ((0,), (3000,))],
+    ids=["300", "prefix-200+300", "mixed-3-requests", "3000"],
+)
+def test_fp8_pool_matches_native_kernel(monkeypatch, compute, prefixes, extends):
+    """An FP8 pool with per-(token, KV head) scales, as the SGLang bridge binds
+    it, read in place through the context slots: aiter's BF16-compute mode
+    must match the native FP8 kernel on the same selection, and its FP8 MFMA
+    mode (FP8 Q and probabilities) stay within a few percent of it."""
+    from atom.model_ops.qwen4_exp.ops.qsa import (
+        qsa_select_paged_tokens,
+        qsa_sparse_paged_gqa,
+        qsa_store_quantized_rows,
+    )
+    from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
+
+    if not qsa_attention._flydsl_arch_supported():
+        pytest.skip("FlyDSL QSA attention needs gfx942")
+    if not qsa_attention._flydsl_takes_fp8():
+        pytest.skip("aiter qsa_sparse_prefill without FP8 K/V")
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_FP8_MFMA", "1" if compute == "fp8" else "0")
+
+    device, block, ratio, budget, heads, dim = "cuda", 64, 4, 2048, 12, 256
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, dtype=torch.bfloat16, device=device, generator=gen)
+
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    width = max(-(-s // block) for s in seqs)
+    pages = len(seqs) * width
+    tables = (
+        torch.randperm(pages, device=device, generator=gen)
+        .view(len(seqs), width)
+        .to(torch.int32)
+    )
+
+    def packed(lengths, starts):
+        positions = torch.cat(
+            [torch.arange(s, s + n, device=device) for s, n in zip(starts, lengths)]
+        )
+        requests = torch.cat(
+            [
+                torch.full((n,), r, dtype=torch.int32, device=device)
+                for r, n in enumerate(lengths)
+            ]
+        )
+        slots = (
+            tables[requests.long(), positions // block].long() * block
+            + positions % block
+        )
+        return positions, requests, slots
+
+    # Every context token's K/V (prefix and extend) quantized into the pool.
+    k_cache = torch.zeros(pages, block, 1, dim, dtype=FP8_DTYPE, device=device)
+    v_cache = torch.zeros_like(k_cache)
+    k_scale = torch.zeros(pages, block, 1, device=device)
+    v_scale = torch.zeros_like(k_scale)
+    _, _, context = packed(seqs, [0] * len(seqs))
+    qsa_store_quantized_rows(
+        k_cache,
+        k_scale,
+        context,
+        randn(context.numel(), 1, dim),
+        v_cache,
+        v_scale,
+        randn(context.numel(), 1, dim),
+    )
+    positions, token_to_req, _ = packed(extends, prefixes)
+    selected = qsa_select_paged_tokens(
+        randn(positions.numel(), 4, 128),
+        randn(pages, block // ratio, 1, 128),
+        tables,
+        token_to_req,
+        positions,
+        torch.tensor(seqs, dtype=torch.int32, device=device),
+        budget,
+        ratio,
+        max_seq_len=max(seqs),
+        allow_flydsl=True,
+    )
+    query = randn(positions.numel(), heads, dim)
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=seqs)
+    host_lens, context_slots = _flydsl_prefill_layout(
+        batch, len(seqs), positions.numel(), tables, block, read_pool=True
+    )
+    layer = _layer(
+        indexer=SimpleNamespace(compress_ratio=ratio, token_topk=budget),
+        num_heads=heads,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale_cache=k_scale,
+        v_scale_cache=v_scale,
+    )
+    qsa = SimpleNamespace(host_lens=host_lens, context_slots=context_slots)
+    flydsl = Qwen4ExpAttention._flydsl_attention(
+        layer, query, None, None, selected, qsa
+    )
+    assert flydsl is not None
+    native = qsa_sparse_paged_gqa(
+        query,
+        k_cache,
+        v_cache,
+        selected,
+        tables,
+        token_to_req,
+        softmax_scale=layer.scaling,
+        num_decode_requests=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    if compute == "bf16":
+        torch.testing.assert_close(flydsl, native, atol=2e-2, rtol=2e-2)
+        return
+    # Per-(row, head) norm-relative errors; norms below the median count as
+    # the median, so rows whose values cancel keep their absolute error.
+    norms = native.float().norm(dim=-1)
+    floor = torch.maximum(norms, norms.median().clamp_min(1e-6))
+    error = (flydsl.float() - native.float()).norm(dim=-1) / floor
+    assert float(error.mean()) < 0.05 and float(error.max()) < 0.2, (
+        float(error.mean()),
+        float(error.max()),
+    )
